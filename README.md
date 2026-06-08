@@ -13,6 +13,23 @@ A minimal local web server that lets you browse, download, and upload files betw
 
 ---
 
+## Quick Start
+
+**1. Install all requirements (one time):**
+```bash
+brew install android-platform-tools
+```
+
+**2. Run the server:**
+```bash
+python3 server.py [port]
+```
+Replace `[port]` with any port number (e.g. `8080`, `9000`). Defaults to `8765` if omitted.
+
+Then open **http://localhost:[port]** in your browser.
+
+---
+
 ## Setup (one time)
 
 ### 1. Install adb
