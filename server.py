@@ -25,6 +25,7 @@ MAC_ROOT = Path.home()
 DOWNLOADS = Path.home() / "Downloads"
 ANDROID_PREFIX = "/android"
 DOWNLOAD_API = "/api/download"
+CANCEL_API   = "/api/cancel"
 SPACE_API    = "/api/space"
 SEARCH_API   = "/api/search"
 
@@ -55,11 +56,19 @@ def adb_shell(cmd):
     return result.stdout, result.stderr
 
 
+_adb_connected_cache = {"value": False, "ts": 0}
+
 def adb_connected():
-    """Return True if at least one adb device is online."""
+    """Return True if at least one adb device is online. Cached for 5s."""
+    now = time.time()
+    if now - _adb_connected_cache["ts"] < 5:
+        return _adb_connected_cache["value"]
     result = subprocess.run(["adb", "devices"], capture_output=True, text=True)
     lines = [l for l in result.stdout.splitlines() if l and "List of" not in l]
-    return any("device" in l for l in lines)
+    val = any("device" in l for l in lines)
+    _adb_connected_cache["value"] = val
+    _adb_connected_cache["ts"] = now
+    return val
 
 
 def adb_ls(path):
@@ -92,37 +101,33 @@ def adb_file_size(remote_path):
 
 
 def adb_pull_tracked(token, remote_path, dest_path):
-    """Run adb pull in a thread, tracking progress by watching dest file size."""
-    size = adb_file_size(remote_path)
-    with _jobs_lock:
-        _jobs[token]["size"] = size
-
+    """Run adb pull in a thread, tracking progress via adb output."""
     proc = subprocess.Popen(
         ["adb", "pull", remote_path, str(dest_path)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
+    with _jobs_lock:
+        _jobs[token]["proc"] = proc
 
-    # Watch dest file size grow in a background thread
-    def watch_size():
-        while proc.poll() is None:
+    for line in proc.stdout:
+        line = line.strip()
+        if line.startswith("[") and "%" in line:
             try:
-                current = Path(dest_path).stat().st_size if Path(dest_path).exists() else 0
-                if size > 0:
-                    pct = min(99, int(current * 100 / size))
-                    with _jobs_lock:
-                        _jobs[token]["progress"] = pct
-            except Exception:
+                pct = int(line.split("%")[0].strip().lstrip("[").strip())
+                with _jobs_lock:
+                    if _jobs[token]["status"] == "cancelled":
+                        proc.kill()
+                        break
+                    _jobs[token]["progress"] = min(99, pct)
+            except ValueError:
                 pass
-            time.sleep(0.5)
-
-    watcher = threading.Thread(target=watch_size, daemon=True)
-    watcher.start()
 
     proc.wait()
-    watcher.join(timeout=1)
 
     with _jobs_lock:
-        if proc.returncode == 0:
+        if _jobs[token]["status"] == "cancelled":
+            Path(dest_path).unlink(missing_ok=True)
+        elif proc.returncode == 0:
             _jobs[token]["progress"] = 100
             _jobs[token]["status"] = "done"
             _jobs[token]["dest"] = str(dest_path)
@@ -146,23 +151,32 @@ def adb_folder_pull_tracked(token, remote_path, folder_name):
         ["adb", "pull", remote_path, dest_tmp],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
+    with _jobs_lock:
+        _jobs[token]["proc"] = proc
+
     for line in proc.stdout:
         line = line.strip()
         if line.startswith("[") and "%" in line:
             try:
                 pct = int(line.split("%")[0].strip().lstrip("[").strip())
-                # scale to 0-80 so zipping is 80-100
                 with _jobs_lock:
+                    if _jobs[token]["status"] == "cancelled":
+                        proc.kill()
+                        break
                     _jobs[token]["progress"] = int(pct * 0.8)
             except ValueError:
                 pass
     proc.wait()
 
-    if proc.returncode != 0:
+    with _jobs_lock:
+        cancelled = _jobs[token]["status"] == "cancelled"
+
+    if cancelled or proc.returncode != 0:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         with _jobs_lock:
-            _jobs[token]["status"] = "error"
-            _jobs[token]["error"]  = "adb pull failed"
+            if not cancelled:
+                _jobs[token]["status"] = "error"
+                _jobs[token]["error"]  = "adb pull failed"
         return
 
     # Zip it up
@@ -175,10 +189,21 @@ def adb_folder_pull_tracked(token, remote_path, folder_name):
     while zip_dest.exists():
         zip_dest = DOWNLOADS / f"{stem}_{c}.zip"; c += 1
 
-    with zipfile.ZipFile(str(zip_dest), "w", zipfile.ZIP_DEFLATED) as zf:
+    # Already-compressed formats gain nothing from deflate — store them raw
+    _NO_COMPRESS = {
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic",
+        ".mp4", ".mov", ".avi", ".mkv", ".webm",
+        ".mp3", ".aac", ".m4a", ".flac", ".wav",
+        ".zip", ".gz", ".7z", ".rar",
+    }
+    with zipfile.ZipFile(str(zip_dest), "w") as zf:
         pulled = Path(dest_tmp)
         for f in pulled.rglob("*"):
-            zf.write(f, f.relative_to(pulled.parent))
+            if f.is_file():
+                ext = f.suffix.lower()
+                compress = zipfile.ZIP_STORED if ext in _NO_COMPRESS else zipfile.ZIP_DEFLATED
+                zf.write(f, f.relative_to(pulled.parent), compress_type=compress,
+                         compresslevel=None if compress == zipfile.ZIP_STORED else 1)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -509,10 +534,7 @@ function escHtml(s) {
 
 // ── README Modal ──────────────────────────────────────────────────────────────
 function openModal()  { document.getElementById('readmeModal').classList.remove('hidden'); }
-function closeModal() { document.getElementById('readmeModal').classList.add('hidden'); sessionStorage.setItem('ft_seen','1'); }
-
-// Show once per session (resets on page refresh, not on folder navigation)
-if (!sessionStorage.getItem('ft_seen')) { openModal(); sessionStorage.setItem('ft_seen','1'); }
+function closeModal() { document.getElementById('readmeModal').classList.add('hidden'); }
 
 // Close on backdrop click
 document.getElementById('readmeModal').addEventListener('click', (e) => {
@@ -541,7 +563,9 @@ function dlFile(btn, androidPath, fileName, fileSize, isFolder) {
         btn.textContent = 'No space';
         return;
       }
-      btn.textContent = isFolder ? 'Zipping…' : 'Downloading…';
+
+      btn.textContent = '⏹ Stop';
+      btn.disabled = false;
       ptext.textContent = 'Starting…';
 
       const url = '/api/download?path=' + encodeURIComponent(androidPath)
@@ -552,10 +576,21 @@ function dlFile(btn, androidPath, fileName, fileSize, isFolder) {
         if (job.error) {
           fill.classList.add('error'); fill.style.width = '100%';
           ptext.textContent = 'Error: ' + job.error;
-          btn.textContent = 'Failed';
+          btn.textContent = '↩ Again'; btn.disabled = false;
+          btn.onclick = () => { resetProgress(fill, ptext); dlFile(btn, androidPath, fileName, fileSize, isFolder); };
           return;
         }
         const token = job.token;
+
+        btn.onclick = () => {
+          fetch('/api/cancel?token=' + token);
+          clearInterval(iv);
+          fill.classList.add('error'); fill.style.width = '100%';
+          ptext.textContent = 'Cancelled';
+          btn.textContent = '↩ Again'; btn.disabled = false;
+          btn.onclick = () => { resetProgress(fill, ptext); dlFile(btn, androidPath, fileName, fileSize, isFolder); };
+        };
+
         const iv = setInterval(() => {
           fetch('/api/download?token=' + token).then(r => r.json()).then(s => {
             const pct = s.progress || 0;
@@ -564,13 +599,16 @@ function dlFile(btn, androidPath, fileName, fileSize, isFolder) {
               clearInterval(iv);
               fill.classList.add('done'); fill.style.width = '100%';
               ptext.textContent = `Saved to ~/Downloads/${s.name || fileName}`;
-              btn.textContent = 'Done ✓';
-            } else if (s.status === 'error') {
+              btn.textContent = '↩ Again'; btn.disabled = false;
+              btn.onclick = () => { resetProgress(fill, ptext); dlFile(btn, androidPath, fileName, fileSize, isFolder); };
+            } else if (s.status === 'error' || s.status === 'cancelled') {
               clearInterval(iv);
               fill.classList.add('error'); fill.style.width = '100%';
-              ptext.textContent = 'Download failed';
-              btn.textContent = 'Failed'; btn.disabled = false;
+              ptext.textContent = s.status === 'cancelled' ? 'Cancelled' : 'Download failed';
+              btn.textContent = '↩ Again'; btn.disabled = false;
+              btn.onclick = () => { resetProgress(fill, ptext); dlFile(btn, androidPath, fileName, fileSize, isFolder); };
             } else {
+              btn.textContent = '⏹ Stop';
               ptext.textContent = pct + '%' + (isFolder ? ' (pulling + zipping)' : '');
             }
           });
@@ -579,8 +617,15 @@ function dlFile(btn, androidPath, fileName, fileSize, isFolder) {
     })
     .catch(err => {
       ptext.textContent = 'Error: ' + err;
-      btn.textContent = 'Error'; btn.disabled = false;
+      btn.textContent = '↩ Again'; btn.disabled = false;
+      btn.onclick = () => { resetProgress(fill, ptext); dlFile(btn, androidPath, fileName, fileSize, isFolder); };
     });
+}
+
+function resetProgress(fill, ptext) {
+  fill.className = 'prog-fill';
+  fill.style.width = '0%';
+  ptext.textContent = '';
 }
 """
 
@@ -699,7 +744,7 @@ def render_page(breadcrumb_html, entries, current_url, mode, upload=True, androi
 <body>
 
 <!-- README Modal -->
-<div class="modal-backdrop" id="readmeModal">
+<div class="modal-backdrop hidden" id="readmeModal">
   <div class="modal">
     <div class="modal-header">
       <h2>📡 FileTransfer — Quick Start</h2>
@@ -753,7 +798,7 @@ kill $(lsof -ti:8765)    # stop</code></pre>
       <input id="searchInput" type="search" placeholder="Search files &amp; folders…" autocomplete="off">
       <button class="search-clear" id="searchClear" title="Clear">✕</button>
     </div>
-    <button class="help-btn" onclick="openModal()">? Help</button>
+    <button class="help-btn" onclick="openModal()">📖 Instructions</button>
   </div>
   <div class="breadcrumb">{breadcrumb_html}</div>
 </header>
@@ -784,6 +829,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_space(qs)
         elif raw == SEARCH_API:
             self.handle_search(qs)
+        elif raw == CANCEL_API:
+            self.handle_cancel(qs)
         elif raw == DOWNLOAD_API:
             self.handle_download_api(qs)
         elif raw.startswith(ANDROID_PREFIX):
@@ -876,18 +923,34 @@ class Handler(BaseHTTPRequestHandler):
         thread.start()
         self._json({"token": token})
 
+    # ── /api/cancel ───────────────────────────────────────────
+
+    def handle_cancel(self, qs):
+        token = qs.get("token", [""])[0]
+        with _jobs_lock:
+            job = _jobs.get(token)
+            if job and job.get("status") == "running":
+                job["status"] = "cancelled"
+                proc = job.get("proc")
+                if proc:
+                    proc.kill()
+                self._json({"ok": True})
+                return
+        self._json({"ok": False})
+
     # ── Android browse ────────────────────────────────────────
 
     def handle_android_get(self, url_path):
         if not adb_connected():
-            self.send_error(503, "Android device not connected — plug in your phone and enable USB Debugging")
+            self.send_error(503, "Android device not connected - plug in your phone and enable USB Debugging")
             return
 
         rel          = url_path[len(ANDROID_PREFIX):]
         android_path = "/sdcard" + (rel if rel else "/")
 
-        out, _ = adb_shell(["test", "-d", f'"{android_path}"', "&&", "echo", "DIR", "||", "echo", "FILE"])
-        is_dir = "DIR" in out
+        # Use ls -ld to check type without listing contents — works on empty dirs too
+        out, err = adb_shell(["ls", "-ld", f'"{android_path}"'])
+        is_dir = out.strip().startswith("d")
 
         if is_dir:
             entries = adb_ls(android_path)
