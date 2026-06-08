@@ -15,6 +15,7 @@ import socket
 import tempfile
 import threading
 import time
+import shlex
 import urllib.parse
 import zipfile
 from pathlib import Path
@@ -52,7 +53,10 @@ def free_bytes():
 
 
 def adb_shell(cmd):
-    result = subprocess.run(["adb", "shell"] + cmd, capture_output=True, text=True)
+    # Pass the command as a single shell string so Android's sh correctly
+    # handles quoted paths with spaces (list args would split on spaces).
+    shell_cmd = " ".join(cmd)
+    result = subprocess.run(["adb", "shell", shell_cmd], capture_output=True, text=True)
     return result.stdout, result.stderr
 
 
@@ -72,28 +76,39 @@ def adb_connected():
 
 
 def adb_ls(path):
-    out, _ = adb_shell(["ls", "-la", f'"{path}"'])
+    out, _ = adb_shell(["ls", "-la", shlex.quote(path)])
     entries = []
     for line in out.splitlines():
+        if "Permission denied" in line or "opendir failed" in line or "No such file" in line:
+            continue
         parts = line.split()
         if len(parts) < 4:
             continue
         perms = parts[0]
         is_dir = perms.startswith("d")
         is_link = perms.startswith("l")
-        name = parts[-1] if not is_link else parts[-3]
+
+        # Reconstruct full name from everything after the fixed prefix columns
+        # Android ls -la: perms links user group size date time name
+        # That's 8 columns before the name (indices 0-7), name starts at index 7
+        name_part = " ".join(parts[7:]) if len(parts) > 7 else parts[-1]
+        if is_link and " -> " in name_part:
+            name = name_part.split(" -> ")[0]
+        else:
+            name = name_part
+
         if name in (".", ".."):
             continue
         try:
-            size = int(parts[3]) if not is_dir else 0
+            size = int(parts[4]) if not is_dir else 0
         except (ValueError, IndexError):
             size = 0
-        entries.append((name, is_dir or is_link, size))
+        entries.append((name, is_dir, size))
     return sorted(entries, key=lambda x: (not x[1], x[0].lower()))
 
 
 def adb_file_size(remote_path):
-    out, _ = adb_shell(["stat", "-c", "%s", f'"{remote_path}"'])
+    out, _ = adb_shell(["stat", "-c", "%s", shlex.quote(remote_path)])
     try:
         return int(out.strip())
     except ValueError:
@@ -157,7 +172,7 @@ def adb_folder_pull_tracked(token, remote_path, folder_name):
     dest_tmp = os.path.join(tmp_dir, folder_name)
     os.makedirs(dest_tmp, exist_ok=True)
 
-    out, _ = adb_shell(["du", "-sb", f'"{remote_path}"'])
+    out, _ = adb_shell(["du", "-sb", shlex.quote(remote_path)])
     try:
         total = int(out.strip().split()[0])
     except (ValueError, IndexError):
@@ -647,6 +662,36 @@ function resetProgress(fill, ptext) {
 
 # ── Page renderer ─────────────────────────────────────────────────────────────
 
+def render_page_error(breadcrumb_html, message):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FileTransfer</title>
+<style>{CSS}</style>
+</head>
+<body>
+<header>
+  <div class="header-top">
+    <h1>📡 FileTransfer</h1>
+    <div class="tabs">
+      <a class="tab" href="/">💻 Mac</a>
+      <a class="tab active" href="{ANDROID_PREFIX}">📱 Android <span class="badge">USB</span></a>
+    </div>
+  </div>
+  <div class="breadcrumb">{breadcrumb_html}</div>
+</header>
+<div class="container">
+  <div class="file-list">
+    <div class="empty" style="color:#ef4444;">🔒 {html.escape(message)}</div>
+  </div>
+</div>
+<script>{JS}</script>
+</body>
+</html>""".encode()
+
+
 def render_page(breadcrumb_html, entries, current_url, mode, upload=True, android_ok=True):
     url_path = current_url.rstrip("/")
 
@@ -883,7 +928,7 @@ class Handler(BaseHTTPRequestHandler):
         results = []
         for p in paths:
             name   = Path(p).name
-            out, _ = adb_shell(["test", "-d", f'"{p}"', "&&", "echo", "DIR", "||", "echo", "FILE"])
+            out, _ = adb_shell(["test", "-d", shlex.quote(p), "&&", "echo", "DIR", "||", "echo", "FILE"])
             is_dir = "DIR" in out
             size   = 0 if is_dir else adb_file_size(p)
             results.append({"path": p, "name": name, "is_dir": is_dir, "size": size})
@@ -964,11 +1009,10 @@ class Handler(BaseHTTPRequestHandler):
         rel          = url_path[len(ANDROID_PREFIX):]
         android_path = "/sdcard" + (rel if rel else "/")
 
-        # Use ls -ld to check type without listing contents — works on empty dirs too
-        out, err = adb_shell(["ls", "-ld", f'"{android_path}"'])
-        is_dir = out.strip().startswith("d")
+        out, err = adb_shell(["ls", "-ld", shlex.quote(android_path)])
+        first = out.strip()
 
-        if is_dir:
+        if first.startswith("d"):
             entries = adb_ls(android_path)
             parts   = rel.strip("/").split("/") if rel.strip("/") else []
             crumbs  = [f'<a href="{ANDROID_PREFIX}">📱 Android</a>']
@@ -977,8 +1021,16 @@ class Handler(BaseHTTPRequestHandler):
                 crumbs.append(f'<a href="{html.escape(link)}">{html.escape(part)}</a>')
             body = render_page(" / ".join(crumbs), entries, url_path, "android", android_ok=True)
             self._send_html(body)
+        elif not first or "Permission denied" in out + err or "Permission denied" in first:
+            parts  = rel.strip("/").split("/") if rel.strip("/") else []
+            crumbs = [f'<a href="{ANDROID_PREFIX}">📱 Android</a>']
+            for i, part in enumerate(parts):
+                link = ANDROID_PREFIX + "/" + "/".join(parts[:i+1])
+                crumbs.append(f'<a href="{html.escape(link)}">{html.escape(part)}</a>')
+            body = render_page_error(" / ".join(crumbs), "Permission denied — this folder is restricted by Android.")
+            self._send_html(body)
         else:
-            # Direct inline view (tap on filename still works)
+            # It's a file — direct inline view
             self._serve_android_file(android_path)
 
     def _serve_android_file(self, android_path):
