@@ -101,7 +101,8 @@ def adb_file_size(remote_path):
 
 
 def adb_pull_tracked(token, remote_path, dest_path):
-    """Run adb pull in a thread, tracking progress via adb output."""
+    total = adb_file_size(remote_path)
+
     proc = subprocess.Popen(
         ["adb", "pull", remote_path, str(dest_path)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
@@ -109,18 +110,17 @@ def adb_pull_tracked(token, remote_path, dest_path):
     with _jobs_lock:
         _jobs[token]["proc"] = proc
 
-    for line in proc.stdout:
-        line = line.strip()
-        if line.startswith("[") and "%" in line:
-            try:
-                pct = int(line.split("%")[0].strip().lstrip("[").strip())
-                with _jobs_lock:
-                    if _jobs[token]["status"] == "cancelled":
-                        proc.kill()
-                        break
-                    _jobs[token]["progress"] = min(99, pct)
-            except ValueError:
-                pass
+    dest = Path(dest_path)
+    while proc.poll() is None:
+        with _jobs_lock:
+            if _jobs[token]["status"] == "cancelled":
+                proc.kill()
+                break
+        if total > 0 and dest.exists():
+            pct = int(dest.stat().st_size / total * 99)
+            with _jobs_lock:
+                _jobs[token]["progress"] = min(99, pct)
+        time.sleep(0.25)
 
     proc.wait()
 
@@ -141,11 +141,27 @@ def adb_push(local_path, remote_path):
     return result.returncode == 0
 
 
+def _dir_size(path):
+    total = 0
+    for f in Path(path).rglob("*"):
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
 def adb_folder_pull_tracked(token, remote_path, folder_name):
-    """Pull entire folder from Android, zip it, save to ~/Downloads."""
     tmp_dir = tempfile.mkdtemp()
     dest_tmp = os.path.join(tmp_dir, folder_name)
     os.makedirs(dest_tmp, exist_ok=True)
+
+    out, _ = adb_shell(["du", "-sb", f'"{remote_path}"'])
+    try:
+        total = int(out.strip().split()[0])
+    except (ValueError, IndexError):
+        total = 0
 
     proc = subprocess.Popen(
         ["adb", "pull", remote_path, dest_tmp],
@@ -154,18 +170,17 @@ def adb_folder_pull_tracked(token, remote_path, folder_name):
     with _jobs_lock:
         _jobs[token]["proc"] = proc
 
-    for line in proc.stdout:
-        line = line.strip()
-        if line.startswith("[") and "%" in line:
-            try:
-                pct = int(line.split("%")[0].strip().lstrip("[").strip())
-                with _jobs_lock:
-                    if _jobs[token]["status"] == "cancelled":
-                        proc.kill()
-                        break
-                    _jobs[token]["progress"] = int(pct * 0.8)
-            except ValueError:
-                pass
+    while proc.poll() is None:
+        with _jobs_lock:
+            if _jobs[token]["status"] == "cancelled":
+                proc.kill()
+                break
+        if total > 0:
+            pct = int(_dir_size(dest_tmp) / total * 80)
+            with _jobs_lock:
+                _jobs[token]["progress"] = min(80, pct)
+        time.sleep(0.25)
+
     proc.wait()
 
     with _jobs_lock:
@@ -889,7 +904,8 @@ class Handler(BaseHTTPRequestHandler):
         if "token" in qs:
             token = qs["token"][0]
             with _jobs_lock:
-                job = dict(_jobs.get(token, {"status": "unknown", "progress": 0}))
+                raw = _jobs.get(token, {"status": "unknown", "progress": 0})
+                job = {k: v for k, v in raw.items() if k != "proc"}
             self._json(job)
             return
 
