@@ -1179,16 +1179,31 @@ def main():
     phone_connected = any("device" in l for l in lines)
     free = free_bytes()
 
+    port = PORT
+    while True:
+        try:
+            server = HTTPServer(("0.0.0.0", port), Handler)
+            break
+        except OSError as e:
+            if e.errno == 48:  # Address already in use
+                print(f"  Port {port} busy, trying {port + 1}…")
+                port += 1
+            else:
+                raise
+
     print(f"\n  📡 FileTransfer Server")
     print(f"  ─────────────────────────────────")
-    print(f"  Local  : http://localhost:{PORT}")
-    print(f"  Network: http://{ip}:{PORT}")
+    print(f"  Local  : http://localhost:{port}")
+    print(f"  Network: http://{ip}:{port}")
     print(f"  Android: {'✅ connected' if phone_connected else '❌ not detected'}")
     print(f"  Free   : {format_size(free)} on Mac")
     print(f"\n  Downloads save to: {DOWNLOADS}")
     print(f"  Press Ctrl+C to stop.\n")
 
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    threading.Timer(0.5, lambda: subprocess.Popen(
+        ["open", f"http://localhost:{port}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
