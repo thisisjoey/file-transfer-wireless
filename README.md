@@ -17,7 +17,7 @@ A minimal local web server that lets you browse, download, and upload files betw
 
 **1. Install all requirements (one time):**
 ```bash
-brew install android-platform-tools
+bash install.sh
 ```
 
 **2. Run the server:**
