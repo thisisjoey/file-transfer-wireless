@@ -55,6 +55,13 @@ def adb_shell(cmd):
     return result.stdout, result.stderr
 
 
+def adb_connected():
+    """Return True if at least one adb device is online."""
+    result = subprocess.run(["adb", "devices"], capture_output=True, text=True)
+    lines = [l for l in result.stdout.splitlines() if l and "List of" not in l]
+    return any("device" in l for l in lines)
+
+
 def adb_ls(path):
     out, _ = adb_shell(["ls", "-la", f'"{path}"'])
     entries = []
@@ -502,10 +509,10 @@ function escHtml(s) {
 
 // ── README Modal ──────────────────────────────────────────────────────────────
 function openModal()  { document.getElementById('readmeModal').classList.remove('hidden'); }
-function closeModal() { document.getElementById('readmeModal').classList.add('hidden'); localStorage.setItem('ft_seen','1'); }
+function closeModal() { document.getElementById('readmeModal').classList.add('hidden'); sessionStorage.setItem('ft_seen','1'); }
 
-// Show on first visit only
-if (!localStorage.getItem('ft_seen')) openModal();
+// Show once per session (resets on page refresh, not on folder navigation)
+if (!sessionStorage.getItem('ft_seen')) { openModal(); sessionStorage.setItem('ft_seen','1'); }
 
 // Close on backdrop click
 document.getElementById('readmeModal').addEventListener('click', (e) => {
@@ -580,7 +587,7 @@ function dlFile(btn, androidPath, fileName, fileSize, isFolder) {
 
 # ── Page renderer ─────────────────────────────────────────────────────────────
 
-def render_page(breadcrumb_html, entries, current_url, mode, upload=True):
+def render_page(breadcrumb_html, entries, current_url, mode, upload=True, android_ok=True):
     url_path = current_url.rstrip("/")
 
     if mode == "android":
@@ -652,6 +659,10 @@ def render_page(breadcrumb_html, entries, current_url, mode, upload=True):
     mac_active   = "" if mode == "android" else " active"
     and_active   = " active" if mode == "android" else ""
     deep_search  = "true" if mode == "android" else "false"
+    if android_ok:
+        android_tab = f'<a class="tab{and_active}" href="{ANDROID_PREFIX}">📱 Android <span class="badge">USB</span></a>'
+    else:
+        android_tab = '<span class="tab" style="opacity:0.35;cursor:default;" title="No Android device connected">📱 Android</span>'
 
     free = free_bytes()
     space_line = f'<div class="space-info">Mac free space: {format_size(free)}</div>'
@@ -736,7 +747,7 @@ kill $(lsof -ti:8765)    # stop</code></pre>
     <h1>📡 FileTransfer</h1>
     <div class="tabs">
       <a class="tab{mac_active}" href="/">💻 Mac</a>
-      <a class="tab{and_active}" href="{ANDROID_PREFIX}">📱 Android <span class="badge">USB</span></a>
+      {android_tab}
     </div>
     <div class="search-wrap">
       <input id="searchInput" type="search" placeholder="Search files &amp; folders…" autocomplete="off">
@@ -868,6 +879,10 @@ class Handler(BaseHTTPRequestHandler):
     # ── Android browse ────────────────────────────────────────
 
     def handle_android_get(self, url_path):
+        if not adb_connected():
+            self.send_error(503, "Android device not connected — plug in your phone and enable USB Debugging")
+            return
+
         rel          = url_path[len(ANDROID_PREFIX):]
         android_path = "/sdcard" + (rel if rel else "/")
 
@@ -881,7 +896,7 @@ class Handler(BaseHTTPRequestHandler):
             for i, part in enumerate(parts):
                 link = ANDROID_PREFIX + "/" + "/".join(parts[:i+1])
                 crumbs.append(f'<a href="{html.escape(link)}">{html.escape(part)}</a>')
-            body = render_page(" / ".join(crumbs), entries, url_path, "android")
+            body = render_page(" / ".join(crumbs), entries, url_path, "android", android_ok=True)
             self._send_html(body)
         else:
             # Direct inline view (tap on filename still works)
@@ -936,7 +951,7 @@ class Handler(BaseHTTPRequestHandler):
         for i, part in enumerate(parts):
             link = "/" + "/".join(parts[:i+1])
             crumbs.append(f'<a href="{html.escape(link)}">{html.escape(part)}</a>')
-        self._send_html(render_page(" / ".join(crumbs), entries, raw, "mac"))
+        self._send_html(render_page(" / ".join(crumbs), entries, raw, "mac", android_ok=adb_connected()))
 
     def _serve_mac_file(self, path):
         mime, _ = mimetypes.guess_type(str(path))
