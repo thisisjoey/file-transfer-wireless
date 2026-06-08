@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+import os, sys, runpy
+SERVER = "/Users/bhupesh/Desktop/Apps/file-transfer/server.py"
+os.chdir(os.path.dirname(SERVER))
+sys.argv = [SERVER] + sys.argv[1:]
+runpy.run_path(SERVER, run_name="__main__")
