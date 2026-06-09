@@ -1,129 +1,106 @@
-# 📡 FileTransfer
+# 📡 FileTransfer Wireless
 
-A minimal local web server that lets you browse, download, and upload files between your **Mac** and **Android phone** over a USB-C cable — entirely through a browser. No apps, no cloud, no Wi-Fi required.
-
----
-
-## Requirements
-
-- macOS
-- Python 3 (pre-installed on Mac)
-- Android phone with USB Debugging enabled
-- USB-C cable
+Transfer files between your **Mac and Android phone over Wi-Fi** — entirely through a browser. No USB cable, no app to install, no cloud, no internet required. Both devices just need to be on the same Wi-Fi network.
 
 ---
 
 ## Quick Start
 
-**1. Install all requirements (one time):**
 ```bash
-bash install.sh
+./filetransfer-wireless
 ```
 
-**2. Run the server:**
-```bash
-python3 server.py [port]
-```
-Replace `[port]` with any port number (e.g. `8080`, `9000`). Defaults to `8765` if omitted.
-
-Then open **http://localhost:[port]** in your browser.
+That's it. On first run it installs everything it needs (adb, qrcode library), then starts the server and opens the browser automatically.
 
 ---
 
-## Setup (one time)
+## Requirements
 
-### 1. Install adb
-```bash
-brew install android-platform-tools
-```
+- macOS 10.15+
+- Python 3 (pre-installed on Mac)
+- Android phone on the **same Wi-Fi network**
 
-### 2. Enable USB Debugging on your Android phone
-- **Settings → About Phone → Version** → tap **Build Number** 7 times
-- Go back → **Additional Settings → Developer Options → USB Debugging** → ON
-
-### 3. Connect your phone
-- Plug in the USB-C cable
-- On your phone, tap **Allow** on the USB Debugging popup
-- Select **File Transfer** mode in the USB notification
+Everything else (`adb`, Python libraries) is installed automatically on first run.
 
 ---
 
-## Usage
+## First-time Phone Setup (one time only)
 
-```bash
-# Start the server (shares your home folder by default)
-python3 server.py
+**1. Enable Developer Options on your phone:**
+- Settings → About Phone → tap **Build Number** 7 times
 
-# Or use the launcher script
-./start.sh
+**2. Enable Wireless Debugging:**
+- Settings → Developer Options → **Wireless Debugging** → ON
 
-# Share a specific folder
-./start.sh ~/Desktop
+**3. Pair with your Mac:**
+- In the Android tab on your Mac, scan the QR code with your phone
+- On your phone: Wireless Debugging → **Pair device with pairing code**
+- Enter the port and 6-digit code shown → tap **Pair & Connect**
 
-# Custom port
-./start.sh ~/Desktop 9000
-```
+This pairing is **permanent** — you never need to do it again for the same Mac.
 
-Open **http://localhost:8765** in your browser.
+---
+
+## Daily Use (after first-time setup)
+
+1. Run `./filetransfer-wireless` on your Mac
+2. On your phone: turn on **Wireless Debugging**
+3. Scan the QR code in the Android tab → connected
 
 ---
 
 ## Features
 
 - **💻 Mac tab** — browse your Mac filesystem, upload files into any folder
-- **📱 Android tab** — browse your phone's storage over USB via adb
-- **⬇ Save button** — on every file and folder; saves directly to `~/Downloads`
-  - Files download with a real-time progress bar
-  - Folders are pulled and zipped automatically
-- **🔍 Search** — searches across the entire phone storage recursively (type 2+ chars)
-- **Upload** — send files from Mac into any Android folder, or vice versa
-- **Disk space check** — verifies free space on Mac before starting any download
+- **📱 Android tab** — browse your phone's storage wirelessly via adb over Wi-Fi
+- **⬇ Save** — download any file or folder to `~/Downloads` with a real-time progress bar
+- **Folders** — pulled and zipped automatically
+- **🔍 Search** — searches entire phone storage recursively (type 2+ chars)
+- **Upload** — send files from Mac → Android or Android → Mac
+- **Disk space check** — verifies free space before every download
+- **QR connect** — scan once to connect, no typing IPs
+
+---
+
+## Usage
+
+```bash
+# Start (default port 8765)
+./filetransfer-wireless
+
+# Custom port
+./filetransfer-wireless 9000
+
+# Stop
+Ctrl+C
+# or
+kill $(lsof -ti:8765)
+```
 
 ---
 
 ## How it works
 
 ```
-Browser (localhost:8765)
-       │
-       ▼
-  server.py  ──── Mac filesystem (direct read/write)
-       │
-       └── adb ── USB-C cable ── Android phone
+Browser (any device on the network)
+        │
+        ▼
+   server.py  ──── Mac filesystem (direct read/write)
+        │
+        └── adb (Wi-Fi) ──── Android phone
 ```
 
-The server runs entirely on your Mac. `adb` handles all communication with the phone over the USB cable. Nothing leaves your local machine.
-
----
-
-## Why it can't be deployed to the cloud (Vercel, etc.)
-
-This tool is **intentionally local-only**:
-- `adb` must run on the same machine the phone is physically connected to
-- Files are streamed directly from your Mac's disk
-- No data is sent to any external server
-
-To access it remotely over the internet, use [ngrok](https://ngrok.com/):
-```bash
-ngrok http 8765
-```
-
----
-
-## Stop the server
-
-Press `Ctrl+C` in the terminal, or:
-```bash
-kill $(lsof -ti:8765)
-```
+The server runs entirely on your Mac. `adb` communicates with the phone over Wi-Fi using Android's Wireless Debugging. Nothing leaves your local network.
 
 ---
 
 ## File structure
 
 ```
-file-transfer/
-├── server.py     # main server
-├── start.sh      # launcher script
-└── README.md     # this file
+file-transfer-wireless/
+├── filetransfer-wireless   # single executable — run this
+├── server.py               # HTTP server
+├── start.sh                # alias for filetransfer-wireless
+├── install.sh              # manual dependency installer (optional)
+└── README.md               # this file
 ```

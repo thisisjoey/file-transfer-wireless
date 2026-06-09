@@ -1,15 +1,16 @@
 #!/bin/bash
+# install.sh — manual dependency installer (optional, filetransfer-wireless does this automatically)
 set -e
 
-echo "Installing FileTransfer dependencies..."
+echo "Installing FileTransfer Wireless dependencies..."
 
-# Install Homebrew if not present
+# Homebrew
 if ! command -v brew &>/dev/null; then
   echo "Installing Homebrew..."
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
 
-# Install adb (Android Debug Bridge)
+# adb
 if ! command -v adb &>/dev/null; then
   echo "Installing adb..."
   brew install android-platform-tools
@@ -17,14 +18,16 @@ else
   echo "adb already installed: $(adb version | head -1)"
 fi
 
-# Check Python 3
+# Python 3
 if ! command -v python3 &>/dev/null; then
-  echo "Python 3 not found. Install it from https://www.python.org/downloads/"
+  echo "Python 3 not found. Install from https://www.python.org/downloads/"
   exit 1
 else
-  echo "Python 3 found: $(python3 --version)"
+  echo "Python 3: $(python3 --version)"
 fi
 
+# qrcode library
+python3 -m pip install --quiet "qrcode[svg]" && echo "qrcode library: ok"
+
 echo ""
-echo "All done! Run the server with:"
-echo "  python3 server.py [port]"
+echo "All done! Start with:  ./filetransfer-wireless"
