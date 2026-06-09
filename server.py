@@ -278,6 +278,41 @@ def adb_push(local_path, remote_path):
     return result.returncode == 0
 
 
+def adb_push_tracked(token, local_path, remote_path, local_size):
+    proc = subprocess.Popen(
+        ["adb", "push", local_path, remote_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    with _jobs_lock:
+        _jobs[token]["proc"] = proc
+
+    while proc.poll() is None:
+        if local_size > 0:
+            out, _ = adb_shell(["stat", "-c", "%s", shlex.quote(remote_path)])
+            try:
+                done = int(out.strip())
+                pct = int(done / local_size * 99)
+                with _jobs_lock:
+                    _jobs[token]["progress"] = min(99, pct)
+            except (ValueError, IndexError):
+                pass
+        time.sleep(0.5)
+
+    proc.wait()
+    try:
+        os.unlink(local_path)
+    except OSError:
+        pass
+
+    with _jobs_lock:
+        if proc.returncode == 0:
+            _jobs[token]["progress"] = 100
+            _jobs[token]["status"] = "done"
+        else:
+            _jobs[token]["status"] = "error"
+            _jobs[token]["error"] = "adb push failed"
+
+
 def _dir_size(path):
     total = 0
     for f in Path(path).rglob("*"):
@@ -626,23 +661,57 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
 
+    const isAndroid = window.location.pathname.startsWith('/android');
+
+    function pollPushProgress(token) {
+      fetch('/api/download?token=' + token)
+        .then(r => r.json())
+        .then(s => {
+          const pct = s.progress || 0;
+          if (fill) fill.style.width = pct + '%';
+          if (ptext) ptext.textContent = `Pushing to phone… ${pct}%`;
+          if (s.status === 'done') {
+            window.location.reload();
+          } else if (s.status === 'error') {
+            if (ptext) ptext.textContent = 'Push failed: ' + (s.error || 'unknown error');
+          } else {
+            setTimeout(() => pollPushProgress(token), 500);
+          }
+        })
+        .catch(() => setTimeout(() => pollPushProgress(token), 1000));
+    }
+
     document.getElementById('uploadForm').addEventListener('submit', (e) => {
       e.preventDefault();
       const fd = new FormData();
       for (const f of input.files) fd.append('files', f);
       const xhr = new XMLHttpRequest();
       xhr.open('POST', window.location.href);
-      xhr.upload.addEventListener('progress', (ev) => {
-        if (ev.lengthComputable && fill) {
-          const pct = Math.round((ev.loaded / ev.total) * 100);
-          fill.style.width = pct + '%';
-          ptext.textContent = `Uploading… ${pct}%`;
-          prog.classList.add('visible');
-        }
-      });
+      if (!isAndroid) {
+        xhr.upload.addEventListener('progress', (ev) => {
+          if (ev.lengthComputable && fill) {
+            const pct = Math.round((ev.loaded / ev.total) * 100);
+            fill.style.width = pct + '%';
+            ptext.textContent = `Uploading… ${pct}%`;
+            prog.classList.add('visible');
+          }
+        });
+      } else {
+        if (prog) prog.classList.add('visible');
+        if (ptext) ptext.textContent = 'Sending to server…';
+      }
       xhr.addEventListener('load', () => {
-        if (xhr.status === 200) window.location.reload();
-        else if (ptext) ptext.textContent = 'Upload failed: ' + xhr.statusText;
+        if (xhr.status === 200) {
+          if (isAndroid) {
+            try {
+              const res = JSON.parse(xhr.responseText);
+              if (res.token) { pollPushProgress(res.token); return; }
+            } catch(_) {}
+          }
+          window.location.reload();
+        } else if (ptext) {
+          ptext.textContent = 'Upload failed: ' + xhr.statusText;
+        }
       });
       xhr.send(fd);
     });
@@ -1744,7 +1813,15 @@ window.addEventListener('load', () => document.getElementById('pairCode').focus(
             self.send_error(400, "No boundary")
             return
         length = int(self.headers.get("Content-Length", 0))
-        data   = self.rfile.read(length)
+        chunks = []
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 1 << 20))  # 1 MB at a time
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
         saved  = 0
         for part in data.split(b"--" + boundary):
             if b"Content-Disposition" not in part:
@@ -1770,8 +1847,19 @@ window.addEventListener('load', () => document.getElementById('pairCode').focus(
                 android_dir = "/sdcard" + (rel if rel else "/")
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix)
                 tmp.write(body); tmp.close()
-                adb_push(tmp.name, android_dir + "/" + filename)
-                os.unlink(tmp.name)
+                token = os.urandom(8).hex()
+                with _jobs_lock:
+                    _jobs[token] = {"status": "running", "progress": 0, "name": filename}
+                threading.Thread(
+                    target=adb_push_tracked,
+                    args=(token, tmp.name, android_dir + "/" + filename, len(body)),
+                    daemon=True
+                ).start()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"token": token}).encode())
+                return
             else:
                 target = (MAC_ROOT / raw.lstrip("/")).resolve()
                 dest   = target / filename
