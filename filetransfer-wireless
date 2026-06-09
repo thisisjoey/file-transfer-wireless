@@ -3,7 +3,7 @@
 # Works on any Mac with macOS 10.15+.
 set -e
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # ── Python 3 ──────────────────────────────────────────────────────────────────
 PYTHON=""
